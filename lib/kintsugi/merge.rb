@@ -7,9 +7,10 @@ require "tmpdir"
 require "tempfile"
 require "xcodeproj"
 
-require_relative "xcodeproj_extensions"
 require_relative "apply_change_to_project"
 require_relative "error"
+require_relative "nanaimo_extensions"
+require_relative "xcodeproj_extensions"
 
 module Kintsugi
   class << self
