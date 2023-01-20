@@ -6,6 +6,10 @@ require "xcodeproj"
 
 module Xcodeproj
   class Project
+    def group_from_path(path)
+      path.empty? ? self.main_group : self[path]
+    end
+
     # Extends `ObjectDictionary` to act like an `Object` if `self` repreresents a project reference.
     class ObjectDictionary
       @@old_to_tree_hash = instance_method(:to_tree_hash)
