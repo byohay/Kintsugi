@@ -3,6 +3,7 @@
 # frozen_string_literal: true
 
 require "xcodeproj"
+require "tty-prompt"
 
 require_relative "utils"
 require_relative "error"
@@ -36,6 +37,8 @@ module Kintsugi
     # @return [void]
     def apply_change_to_project(project, change, base_project)
       return unless change&.key?("rootObject")
+
+      @base_project = base_project
 
       # We iterate over the main group and project references first because they might create file
       # or project references that are referenced in other parts.
@@ -104,9 +107,21 @@ module Kintsugi
         containing_group = project.group_from_path(path)
 
         if containing_group.nil?
-          raise MergeError, "Trying to add or move a group with change #{change} to a group that " \
-            "no longer exists with path '#{path}'. This is considered a conflict that should be " \
-            "resolved manually."
+          containing_group = resolve_merge_error(
+            "Trying to add group #{change["displayName"]} to the group with path #{path} that no " \
+            "longer exists",
+            {
+              "Create group with path #{path}": lambda {
+                containing_group = @base_project.group_from_path(path)
+                containing_group_path = File.dirname(path)
+                group_addition = {containing_group.to_tree_hash => containing_group_path}
+                apply_group_additions(project, group_addition, @base_project)
+                return project.group_from_path(path)
+              },
+              "Ignore adding group #{change["displayName"]}": -> {}
+            }
+          )
+          next if containing_group.nil?
         end
 
         next if !Settings.allow_duplicates &&
@@ -151,9 +166,21 @@ module Kintsugi
         change_key = file_reference_key(change)
 
         if containing_group.nil?
-          raise MergeError, "Trying to add or move a file with change #{change} to a group that " \
-            "no longer exists with path '#{path}'. This is considered a conflict that should be " \
-            "resolved manually."
+          containing_group = resolve_merge_error(
+            "Trying to add or move a file with name '#{change["displayName"]}' to a group that " \
+            "no longer exists with path '#{path}'",
+            {
+              "Create group with path #{path}": lambda {
+                containing_group = @base_project.group_from_path(path)
+                containing_group_path = File.dirname(path)
+                group_addition = {containing_group.to_tree_hash => containing_group_path}
+                apply_group_additions(project, group_addition, @base_project)
+                return project.group_from_path(path)
+              },
+              "Ignore adding file #{change["displayName"]}": -> {}
+            }
+          )
+          next if containing_group.nil?
         end
 
         if (removal_keys_to_references[change_key] || []).empty?
@@ -264,13 +291,20 @@ module Kintsugi
         raise MergeError, "Unsupported added change type for #{change[:added]}"
       end
 
-      subchanges_of_change(change).each do |subchange_name, subchange|
-        if component.nil?
-          raise MergeError, "Trying to apply changes to a component that doesn't exist at path " \
-            "#{change_path}. It was probably removed in a previous commit. This is considered a " \
-            "conflict that should be resolved manually."
-        end
+      if component.nil?
+        component = resolve_merge_error(
+          "Trying to apply changes to a component that doesn't exist at path " \
+          "'#{change_path}'. It was probably removed in a previous commit.",
+          {
+            "Add the component at path #{change_path}": lambda {
+            },
+            "Ignore changes to component": -> {}
+          }
+        )
+        return if component.nil?
+      end
 
+      subchanges_of_change(change).each do |subchange_name, subchange|
         apply_change_to_component(component, subchange_name, subchange, change_path)
       end
     end
@@ -367,18 +401,20 @@ module Kintsugi
 
     def apply_change_to_simple_attribute(component, attribute_name, change)
       new_attribute_value =
-        simple_attribute_value_with_change(component.send(attribute_name), change)
+        simple_attribute_value_with_change(component.send(attribute_name), change, attribute_name)
       component.send("#{attribute_name}=", new_attribute_value)
     end
 
-    def simple_attribute_value_with_change(old_value, change)
+    def simple_attribute_value_with_change(old_value, change, attribute_name)
       type = simple_attribute_type(old_value, change[:removed], change[:added])
-      new_value = new_simple_attribute_value(type, old_value, change[:removed], change[:added])
+      new_value = new_simple_attribute_value(type, old_value, change[:removed], change[:added],
+                                             attribute_name)
 
       subchanges_of_change(change).each do |subchange_name, subchange_value|
         new_value = new_value || old_value || {}
         new_value[subchange_name] =
-          simple_attribute_value_with_change(old_value[subchange_name], subchange_value)
+          simple_attribute_value_with_change(old_value[subchange_name], subchange_value,
+                                             subchange_name)
       end
 
       new_value
@@ -414,28 +450,40 @@ module Kintsugi
       end
     end
 
-    def new_simple_attribute_value(type, old_value, removed_change, added_change)
+    def new_simple_attribute_value(type, old_value, removed_change, added_change, attribute_name)
       if type == Hash
-        new_hash_simple_attribute_value(old_value, removed_change, added_change)
+        new_hash_simple_attribute_value(old_value, removed_change, added_change, attribute_name)
       elsif type == Array
-        new_array_simple_attribute_value(old_value, removed_change, added_change)
+        new_array_simple_attribute_value(old_value, removed_change, added_change, attribute_name)
       elsif type == String
-        new_string_simple_attribute_value(old_value, removed_change, added_change)
+        new_string_simple_attribute_value(old_value, removed_change, added_change, attribute_name)
       else
         raise MergeError, "Unsupported types of all of the values. Existing value: " \
           "'#{old_value}', removed change: '#{removed_change}', added change: '#{added_change}'"
       end
     end
 
-    def new_hash_simple_attribute_value(old_value, removed_change, added_change)
+    def new_hash_simple_attribute_value(old_value, removed_change, added_change, attribute_name)
       return added_change if ((old_value || {}).to_a - (removed_change || {}).to_a).empty?
 
       # First apply the added change to see if there are any conflicts with it.
       new_value = (old_value || {}).merge(added_change || {})
+      conflicting_hash_values = (old_value.to_a - new_value.to_a)
 
-      unless (old_value.to_a - new_value.to_a).empty?
-        raise MergeError, "New hash #{change} contains values that conflict with old hash " \
-          "#{old_value}"
+      unless conflicting_hash_values.empty?
+        new_value = resolve_merge_error(
+          "Trying to add hash value of attribute named '#{attribute_name}': Merging hash " \
+          "#{added_change} into existing hash #{old_value} but it contains values that already " \
+          "exist",
+          {
+            "Override values from new hash": lambda {
+              (old_value || {}).merge(added_change || {})
+            },
+            "Ignore duplicate values in new hash": lambda {
+              (added_change || {}).merge(old_value || {})
+            }
+          }
+        )
       end
 
       if removed_change.nil?
@@ -445,16 +493,21 @@ module Kintsugi
       new_value
         .reject do |key, value|
           if value != removed_change[key] && value != (added_change || {})[key]
-            raise MergeError, "Trying to remove value '#{removed_change[key]}' of hash with key " \
-              "'#{key}' but it changed to #{value}. This is considered a conflict that should be " \
-              "resolved manually."
+            next resolve_merge_error(
+              "Trying to remove hash value of attribute named '#{attribute_name}': Hash expected " \
+              "to contain value '#{removed_change[key]}' in '#{key}' but its value is '#{value}'.",
+              {
+                "Remove value with key '#{key}'": -> { true },
+                "Keep value with key '#{key}'": -> { false }
+              }
+            )
           end
 
           removed_change.key?(key)
         end
     end
 
-    def new_array_simple_attribute_value(old_value, removed_change, added_change)
+    def new_array_simple_attribute_value(old_value, removed_change, added_change, attribute_name)
       if old_value.is_a?(String)
         old_value = [old_value]
       end
@@ -477,10 +530,16 @@ module Kintsugi
       new_value + filtered_added_change
     end
 
-    def new_string_simple_attribute_value(old_value, removed_change, added_change)
+    def new_string_simple_attribute_value(old_value, removed_change, added_change, attribute_name)
       if old_value != removed_change && !old_value.nil? && added_change != old_value
-        raise MergeError, "Trying to remove value '#{removed_change || "nil"}', but the existing " \
-          "value is '#{old_value}'. This is considered a conflict that should be resolved manually."
+        return resolve_merge_error(
+          "Trying to change value of attribute '#{attribute_name} from '#{added_change}' to " \
+          "'#{removed_change || "nil"}', but the existing value is '#{old_value}'",
+          {
+            "Replace with new value '#{added_change}'": -> { added_change },
+            "Keep existing value '#{old_value}'": -> { old_value }
+          }
+        )
       end
 
       added_change
@@ -490,10 +549,15 @@ module Kintsugi
       return if component.nil?
 
       if component.to_tree_hash != change
-        raise MergeError, "Trying to remove an object that changed since then. This is " \
-          "considered a conflict that should be resolved manually. Name of the object is: " \
-          "'#{component.display_name}'. Existing component: #{component.to_tree_hash}. " \
-          "Change: #{change}"
+        resolve_merge_error(
+          "Trying to remove an object named '#{component.display_name}': Expected value of " \
+          "#{change} but its existing value is #{component.to_tree_hash}",
+          {
+            "Keep object": -> {},
+            "Remove object anyway": -> { component.remove_from_project }
+          }
+        )
+        return
       end
 
       if change["isa"] == "PBXFileReference"
@@ -641,11 +705,7 @@ module Kintsugi
         containing_component.file_ref =
           find_variant_group(containing_component.project, change["displayName"])
       when Xcodeproj::Project::PBXGroup, Xcodeproj::Project::PBXVariantGroup
-        if find_group_in_group(containing_component, Xcodeproj::Project::PBXVariantGroup,
-                               change).nil?
-          raise "Group should have been added already, so this is most likely a bug in Kintsugi" \
-            "Change is: #{change}. Change path: #{change_path}"
-        end
+        nil
       else
         raise MergeError, "Trying to add variant group to an unsupported component type " \
           "#{containing_component.isa}. Change is: #{change}"
@@ -852,13 +912,9 @@ module Kintsugi
         containing_component.product_reference =
           find_file(containing_component.project, change["path"])
       when Xcodeproj::Project::PBXBuildFile
+        # TODO: How do I tell all the changes to ignore the file if the user decided to ignore it?
         containing_component.file_ref = find_file(containing_component.project, change["path"])
       when Xcodeproj::Project::PBXGroup, Xcodeproj::Project::PBXVariantGroup
-        if find_file_in_group(containing_component, Xcodeproj::Project::PBXFileReference,
-                              change["path"]).nil?
-          raise "File should have been added already, so this is most likely a bug in Kintsugi" \
-            "Change is: #{change}. Change path: #{change_path}"
-        end
       else
         raise MergeError, "Trying to add file reference to an unsupported component type " \
           "#{containing_component.isa}. Change is: #{change}"
@@ -885,10 +941,6 @@ module Kintsugi
         containing_component[:product_group] = new_group
         add_attributes_to_component(new_group, change, change_path)
       when Xcodeproj::Project::PBXGroup
-        if find_group_in_group(containing_component, Xcodeproj::Project::PBXGroup, change).nil?
-          raise "Group should have been added already, so this is most likely a bug in Kintsugi" \
-            "Change is: #{change}. Change path: #{change_path}"
-        end
       else
         raise MergeError, "Trying to add group to an unsupported component type " \
           "#{containing_component.isa}. Change is: #{change}. Change path: #{change_path}"
@@ -974,6 +1026,21 @@ module Kintsugi
 
     def join_path(left, right)
       left.empty? ? right : "#{left}/#{right}"
+    end
+
+    def resolve_merge_error(message, options)
+      unless Settings.interactive_resolution
+        raise MergeError, "Merge error: #{message}"
+      end
+
+      prompt = TTY::Prompt.new
+      options = options.merge(
+        {Abort: -> { raise MergeError, "Merge error: #{message}" }}
+      )
+
+      prompt.select(
+        "A merge conflict that needs manual intervention occurred: #{message}. Choose one:", options
+      )
     end
   end
 end
